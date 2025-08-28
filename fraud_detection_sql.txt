@@ -1,0 +1,185 @@
+-- =========================================
+-- FRAUD DETECTION USING TRANSACTION DATA (SQLite, fixed)
+-- =========================================
+
+-- Clean slate
+DROP VIEW IF EXISTS suspicious_transactions;
+DROP TABLE IF EXISTS suspicious_rules;
+DROP TABLE IF EXISTS transactions;
+DROP TABLE IF EXISTS cards;
+DROP TABLE IF EXISTS merchants;
+DROP TABLE IF EXISTS customers;
+
+-- 1) CORE TABLES
+CREATE TABLE customers (
+  customer_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  full_name     TEXT NOT NULL,
+  home_country  TEXT,
+  signup_date   TEXT
+);
+
+CREATE TABLE merchants (
+  merchant_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  merchant_name   TEXT NOT NULL,
+  category        TEXT,
+  country         TEXT,
+  latitude        REAL,
+  longitude       REAL,
+  is_blacklisted  INTEGER DEFAULT 0
+);
+
+CREATE TABLE cards (
+  card_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id   INTEGER REFERENCES customers(customer_id),
+  network       TEXT,
+  open_date     TEXT,
+  status        TEXT DEFAULT 'active'
+);
+
+CREATE TABLE transactions (
+  txn_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  card_id       INTEGER REFERENCES cards(card_id),
+  merchant_id   INTEGER REFERENCES merchants(merchant_id),
+  txn_ts        TEXT NOT NULL,   -- 'YYYY-MM-DD HH:MM:SS'
+  amount_usd    REAL NOT NULL,
+  currency      TEXT DEFAULT 'USD',
+  channel       TEXT,            -- 'card_present','ecom','atm'
+  device_id     TEXT,
+  merchant_country TEXT,
+  lat           REAL,
+  lon           REAL,
+  approved      INTEGER DEFAULT 1
+);
+
+-- 2) SAMPLE DATA
+INSERT INTO customers (full_name, home_country, signup_date) VALUES
+  ('Asha Verma', 'IN', '2024-03-01'),
+  ('Rohit Shah', 'IN', '2024-06-15');
+
+INSERT INTO merchants (merchant_name, category, country, latitude, longitude, is_blacklisted) VALUES
+  ('Cafe Bliss', 'F&B', 'IN', 12.9716, 77.5946, 0),
+  ('Global Gadgets', 'Electronics', 'IN', 19.0760, 72.8777, 0),
+  ('EuroMart', 'Retail', 'FR', 48.8566, 2.3522, 0),
+  ('QuickCash ATM', 'ATM', 'IN', 13.0827, 80.2707, 0),
+  ('Sketchy Store', 'Misc', 'RU', 55.7558, 37.6173, 1);
+
+INSERT INTO cards (customer_id, network, open_date) VALUES
+  (1, 'Visa', '2024-03-02'),
+  (2, 'Mastercard', '2024-06-16');
+
+-- Asha (card 1)
+INSERT INTO transactions (card_id, merchant_id, txn_ts, amount_usd, channel, merchant_country, lat, lon, approved) VALUES
+  (1, 1, '2025-08-27 09:00:00', 6.50,  'card_present', 'IN', 12.9716, 77.5946, 1),
+  (1, 2, '2025-08-27 12:30:00', 120.00,'card_present', 'IN', 19.0760, 72.8777, 1),
+  (1, 1, '2025-08-27 18:45:00', 8.75,  'card_present', 'IN', 12.9716, 77.5946, 1),
+  (1, 2, '2025-08-27 20:00:00', 4200.00,'ecom',        'IN', 19.0760, 72.8777, 1),
+  (1, 3, '2025-08-28 01:00:00', 75.00, 'card_present', 'FR', 48.8566, 2.3522, 1),
+  (1, 2, '2025-08-28 03:00:00', 95.00, 'card_present', 'IN', 19.0760, 72.8777, 1),
+  (1, 5, '2025-08-28 05:10:00', 250.00,'ecom',         'RU', 55.7558, 37.6173, 1);
+
+-- Rohit (card 2) – velocity burst
+INSERT INTO transactions (card_id, merchant_id, txn_ts, amount_usd, channel, merchant_country, lat, lon, approved) VALUES
+  (2, 1, '2025-08-27 10:00:00', 3.00, 'card_present', 'IN', 12.9716, 77.5946, 1),
+  (2, 1, '2025-08-27 10:02:00', 2.90, 'card_present', 'IN', 12.9716, 77.5946, 1),
+  (2, 1, '2025-08-27 10:04:00', 3.10, 'card_present', 'IN', 12.9716, 77.5946, 1),
+  (2, 1, '2025-08-27 10:05:00', 3.05, 'card_present', 'IN', 12.9716, 77.5946, 1),
+  (2, 1, '2025-08-27 10:07:00', 2.95, 'card_present', 'IN', 12.9716, 77.5946, 1),
+  (2, 1, '2025-08-27 10:08:00', 3.15, 'card_present', 'IN', 12.9716, 77.5946, 1);
+
+-- 3) MATERIALIZE RULES TABLE (CTE goes AFTER 'CREATE TABLE ... AS')
+CREATE TABLE suspicious_rules AS
+WITH ordered AS (
+  SELECT
+    t.*,
+    m.category    AS merchant_category,
+    m.is_blacklisted,
+    c.customer_id
+  FROM transactions t
+  JOIN merchants m ON m.merchant_id = t.merchant_id
+  JOIN cards c     ON c.card_id     = t.card_id
+),
+prev_txn AS (
+  SELECT
+    o.*,
+    LAG(o.txn_ts) OVER (PARTITION BY o.card_id ORDER BY o.txn_ts) AS prev_txn_ts
+  FROM ordered o
+),
+roll_avg AS (
+  SELECT
+    p.*,
+    AVG(amount_usd) OVER (
+      PARTITION BY card_id
+      ORDER BY txn_ts
+      ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING
+    ) AS avg_amt_hist
+  FROM prev_txn p
+),
+velocity_10min AS (
+  SELECT r.*,
+    (
+      SELECT COUNT(*)
+      FROM transactions t2
+      WHERE t2.card_id = r.card_id
+        AND t2.txn_ts BETWEEN datetime(r.txn_ts, '-10 minutes') AND r.txn_ts
+    ) AS cnt_10min
+  FROM roll_avg r
+),
+features AS (
+  SELECT
+    v.*,
+    CASE
+      WHEN avg_amt_hist IS NULL OR avg_amt_hist = 0 THEN NULL
+      ELSE amount_usd / avg_amt_hist
+    END AS amt_vs_avg_mult,
+    (CAST(strftime('%H', txn_ts) AS INTEGER) BETWEEN 0 AND 4) AS is_night
+  FROM velocity_10min v
+)
+SELECT
+  f.txn_id, f.card_id, f.customer_id, f.merchant_id, f.txn_ts, f.amount_usd,
+  f.channel, f.merchant_country, f.merchant_category, f.is_blacklisted,
+  f.avg_amt_hist, f.cnt_10min, f.amt_vs_avg_mult, f.is_night,
+
+  -- boolean flags (0/1)
+  (amt_vs_avg_mult IS NOT NULL AND amt_vs_avg_mult >= 3.0) AS rule_amount_spike,
+  (cnt_10min >= 5)                                        AS rule_velocity_burst,
+  (is_blacklisted = 1)                                    AS rule_blacklist,
+  (channel = 'card_present' AND merchant_country <> 'IN') AS rule_foreign_card_present,
+  (is_night = 1)                                          AS rule_night_time,
+
+  -- explainable score
+  (CASE WHEN amt_vs_avg_mult IS NOT NULL AND amt_vs_avg_mult >= 3.0 THEN 40 ELSE 0 END) +
+  (CASE WHEN cnt_10min >= 5 THEN 25 ELSE 0 END) +
+  (CASE WHEN is_blacklisted = 1 THEN 30 ELSE 0 END) +
+  (CASE WHEN channel = 'card_present' AND merchant_country <> 'IN' THEN 15 ELSE 0 END) +
+  (CASE WHEN is_night = 1 THEN 5 ELSE 0 END)
+  AS risk_score
+FROM features f;
+
+-- 4) VIEW for suspicious transactions (score >= 25)
+CREATE VIEW suspicious_transactions AS
+SELECT
+  s.*,
+  CASE
+    WHEN risk_score >= 40 THEN 'HIGH'
+    WHEN risk_score >= 25 THEN 'MEDIUM'
+    ELSE 'LOW'
+  END AS risk_band,
+  TRIM(
+    (CASE WHEN rule_amount_spike       THEN 'amount_spike(>=3x),'     ELSE '' END) ||
+    (CASE WHEN rule_velocity_burst     THEN 'velocity_10min>=5,'      ELSE '' END) ||
+    (CASE WHEN rule_blacklist          THEN 'blacklisted_merchant,'   ELSE '' END) ||
+    (CASE WHEN rule_foreign_card_present THEN 'foreign_card_present,' ELSE '' END) ||
+    (CASE WHEN rule_night_time         THEN 'night_time,'             ELSE '' END)
+  , ',') AS triggered_rules
+FROM suspicious_rules s
+WHERE risk_score >= 25
+ORDER BY risk_score DESC, txn_ts DESC;
+
+-- 5) QUICK CHECKS
+SELECT txn_id, card_id, amount_usd, txn_ts, risk_score, risk_band, triggered_rules
+FROM suspicious_transactions;
+
+SELECT triggered_rules, COUNT(*) AS hits
+FROM suspicious_transactions
+GROUP BY triggered_rules
+ORDER BY hits DESC;
